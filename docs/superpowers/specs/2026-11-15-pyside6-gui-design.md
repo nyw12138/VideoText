@@ -1,45 +1,45 @@
-# PySide6 GUI Migration Design
+# PySide6 图形界面迁移设计
 
-## Goal
+## 目标
 
-Replace the existing Tkinter user interface with a polished PySide6 desktop interface while preserving VideoText's local transcription workflow and worker process behavior.
+将现有 Tkinter 用户界面替换为更易用、视觉风格更统一的 PySide6 桌面界面，同时保留 VideoText 的本地转写流程和工作进程行为。
 
-## Scope
+## 范围
 
-This change is limited to the GUI layer. It retains the existing worker request protocol, worker process, event queue semantics, transcription service, settings fields and persistence location, output formats, and task cancellation behavior. It does not add task history, batch queues, subtitle editing, remote access, or a web interface.
+本次仅改造 GUI 层，保留现有工作进程请求协议、工作进程、事件队列语义、转写服务、设置字段与存储位置、输出格式和任务取消行为。不新增任务历史、批量队列、字幕编辑、远程访问或网页界面。
 
-## User experience
+## 用户体验
 
-The application is a single-window transcription workbench:
+应用采用单窗口转写工作台布局：
 
-- A compact header shows the VideoText name, a short description, and a settings entry point if needed by the final layout.
-- The primary input card contains the video URL field, a paste action, and a prominent Start Transcription button. While a job is active, starting another job is disabled and a Stop Task action is available.
-- Advanced settings are collapsed by default. When expanded, they expose the model, language, output directory, keep-audio option, overwrite option, and open-output-after-completion option.
-- A progress area displays the real processing stages: read media information, download audio, normalize audio, GPU transcription, and write results. It shows the current stage and elapsed time; it does not invent a percentage when the worker cannot report one.
-- A content area provides an idle hint, task log updates while running, and a completion summary with output location and actions to open the output directory and generated TXT/SRT files. Failures show a concise actionable message and preserve a copy-diagnostics action.
-- The visual system uses a light background, restrained card surfaces, consistent typography and spacing, and one accent color for primary actions and the active stage. The URL and log/content areas expand with the window.
+- 顶部显示 VideoText 名称、简短说明；如最终布局需要，可提供设置入口。
+- 主要输入卡片包含视频网址输入框、粘贴操作和醒目的“开始转换”按钮。任务运行时禁用重复启动，并提供“停止任务”操作。
+- 高级设置默认折叠。展开后可设置模型、语言、输出目录、保留音频、覆盖已有结果以及完成后打开输出目录。
+- 进度区域按真实处理阶段显示：读取媒体信息、下载音频、标准化音频、GPU 转写、写入结果。显示当前阶段和已用时间；工作进程未提供准确百分比时，不展示虚构进度。
+- 内容区域在空闲时显示操作提示，任务运行时显示日志，完成后展示结果摘要、输出位置，以及打开输出目录和 TXT/SRT 文件的操作。失败时显示简明且可执行的提示，并保留复制诊断信息的操作。
+- 视觉采用浅色背景、克制的卡片分区、统一的字体与间距，并使用一种强调色突出主要操作和当前阶段。窗口调整大小时，网址和日志/内容区域随之伸缩。
 
-## Architecture and event flow
+## 架构与事件流
 
-PySide6 widgets run on the GUI thread. Existing worker callbacks continue to enqueue worker messages and exits through `WorkerEventQueue`. A Qt timer drains that queue on the GUI thread and updates widgets. Background worker threads must never mutate Qt widgets directly. The existing worker protocol remains the source of task lifecycle and progress data.
+PySide6 控件在 GUI 主线程运行。现有工作进程回调继续通过 `WorkerEventQueue` 放入消息和退出事件。使用 Qt 定时器在 GUI 主线程消费队列并更新控件。后台工作线程不得直接操作 Qt 控件。任务生命周期和进度数据仍以现有工作进程协议为准。
 
-The current Tkinter GUI module is replaced or adapted as the PySide6 entry point. CLI behavior remains unchanged. The `videotext-gui` command continues to launch the desktop application. PySide6 is added as an application dependency, with version constraints selected during implementation based on project compatibility.
+当前 Tkinter GUI 模块将替换或调整为 PySide6 启动入口。CLI 行为保持不变，`videotext-gui` 命令继续启动桌面应用。PySide6 将加入应用依赖，具体版本范围在实施时结合项目兼容性确定。
 
-## Settings and compatibility
+## 设置与兼容性
 
-Keep the current settings path and persisted settings fields, including window geometry, model, language, output directory, and the boolean options. Continue loading existing settings with the current settings loader. Preserve existing output actions and Windows launch behavior. The GUI must continue to support Windows 10/11 and Python 3.11+.
+保持当前设置文件路径和持久化字段，包括窗口尺寸、模型、语言、输出目录及各布尔选项。继续使用现有设置加载逻辑，并保留当前结果操作和 Windows 启动方式。GUI 继续支持 Windows 10/11 和 Python 3.11 及以上版本。
 
-## Error handling and lifecycle
+## 错误处理与生命周期
 
-URL validation errors are presented near the input or in a concise dialog without starting a worker. Worker startup failures, worker-reported failures, cancellations, crashes, and unexpected exit codes remain distinguishable. Closing during a running task prompts before cancellation and shutdown, preserving current behavior. Diagnostic detail remains copyable.
+网址验证失败时，在输入区域附近或通过简明对话框提示，且不启动工作进程。区分工作进程启动失败、进程返回错误、用户取消、进程崩溃和异常退出码。任务运行时关闭窗口仍需在取消任务并退出前询问用户，保持当前行为。诊断详情应可复制。
 
-## Verification
+## 验证
 
-Update GUI tests for the new framework and retain tests for controller, event queue, protocol, and service behavior. Verify the application can start, load settings, validate URLs, render worker stage updates, stop an active task, handle success and failures, expose output actions, and close cleanly. Run the project's relevant test and lint commands after implementation.
+更新 GUI 测试以适配新框架，并保留控制器、事件队列、协议和转写服务测试。验证应用启动、设置加载、网址校验、工作阶段更新、任务停止、成功和失败处理、结果操作及正常关闭。实现后运行项目相关测试和代码风格检查。
 
-## Design self-review
+## 设计自检
 
-- No placeholder requirements remain.
-- GUI responsibilities are separated from worker execution and domain logic.
-- Progress display is constrained to data the worker actually provides.
-- Scope excludes unrelated product features and preserves the current CLI.
+- 文档无待补充占位内容。
+- GUI 职责与工作进程执行、领域逻辑分离。
+- 进度显示只使用工作进程实际提供的数据。
+- 范围聚焦界面迁移，不包含无关产品功能，并保持 CLI 不变。
