@@ -1,15 +1,37 @@
+from __future__ import annotations
+
 import logging
 import logging.handlers
 import os
 import shutil
 import tempfile
 import time
-import tkinter as tk
 import traceback
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+
+from PySide6.QtCore import QRect, QSize, Qt, QTimer
+from PySide6.QtGui import QCloseEvent, QColor, QFont, QPainter, QPainterPath, QPen
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
 from .errors import VideoTextError
 from .gui_controller import WorkerExit, WorkerProcess
@@ -60,7 +82,7 @@ def stage_status(active: str) -> dict[str, str]:
 def attempt_start(start: Callable[[], object]) -> tuple[bool, str]:
     try:
         start()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - convert startup failures into UI diagnostics
         return False, f"{type(exc).__name__}: {exc}"
     return True, ""
 
@@ -69,15 +91,76 @@ def cleanup_failed_start(temp_root: Path) -> None:
     shutil.rmtree(temp_root, ignore_errors=True)
 
 
-class VideoTextApp:
+class ClearCheckBox(QCheckBox):
+    """Checkbox with a deliberately drawn, high-contrast check mark."""
+
+    INDICATOR_SIZE = 18
+    LABEL_GAP = 5
+
+    def sizeHint(self) -> QSize:
+        metrics = self.fontMetrics()
+        return QSize(
+            self.INDICATOR_SIZE + self.LABEL_GAP + metrics.horizontalAdvance(self.text()) + 2,
+            max(self.INDICATOR_SIZE, metrics.height()) + 4,
+        )
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRect(
+            1,
+            (self.height() - self.INDICATOR_SIZE) // 2,
+            self.INDICATOR_SIZE,
+            self.INDICATOR_SIZE,
+        )
+        checked = self.isChecked()
+        enabled = self.isEnabled()
+        if checked and enabled:
+            fill, border, mark = QColor("#3473d1"), QColor("#3473d1"), QColor("#ffffff")
+        elif checked:
+            fill, border, mark = QColor("#d9e0eb"), QColor("#c4cedd"), QColor("#ffffff")
+        elif enabled:
+            fill, border, mark = QColor("#ffffff"), QColor("#aebbd0"), QColor("#ffffff")
+        else:
+            fill, border, mark = QColor("#f1f3f7"), QColor("#d5dbe5"), QColor("#ffffff")
+        painter.setPen(QPen(border, 1))
+        painter.setBrush(fill)
+        painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 4, 4)
+        if checked:
+            path = QPainterPath()
+            path.moveTo(rect.left() + 4, rect.center().y())
+            path.lineTo(rect.left() + 7, rect.center().y() + 3)
+            path.lineTo(rect.right() - 4, rect.center().y() - 4)
+            painter.setPen(
+                QPen(
+                    mark,
+                    2,
+                    Qt.PenStyle.SolidLine,
+                    Qt.PenCapStyle.RoundCap,
+                    Qt.PenJoinStyle.RoundJoin,
+                )
+            )
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(path)
+        text_color = QColor("#4b5669" if enabled else "#9ca5b4")
+        painter.setPen(text_color)
+        label_rect = QRect(
+            rect.right() + self.LABEL_GAP + 1,
+            0,
+            max(0, self.width() - rect.right() - self.LABEL_GAP - 1),
+            self.height(),
+        )
+        painter.drawText(label_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text())
+
+
+class VideoTextWindow(QMainWindow):
     def __init__(
         self,
-        root: tk.Tk,
         controller: WorkerProcess,
         project_root: Path,
         local_app_data: Path,
     ):
-        self.root = root
+        super().__init__()
         self.controller = controller
         self.project_root = project_root
         self.app_data = local_app_data / "VideoText"
@@ -88,163 +171,329 @@ class VideoTextApp:
         self.last_detail = ""
         self.terminal_message_received = False
         self.closing = False
-        self.destroyed = False
         self.active_task_id: str | None = None
         self.worker_events = WorkerEventQueue()
+        self._destroyed = False
 
-        self.root.title("VideoText 视频转文字")
-        self.root.geometry(self.settings.geometry)
-        self.root.minsize(720, 520)
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.setWindowTitle("VideoText 视频转文字")
+        self.setMinimumSize(780, 620)
+        self.resize_from_settings(self.settings.geometry)
+        self._build_ui()
+        self._apply_style()
+        self.url_entry.setFocus()
+        self.event_timer = QTimer(self)
+        self.event_timer.timeout.connect(self._poll_worker_events)
+        self.event_timer.start(100)
+        self.elapsed_timer = QTimer(self)
+        self.elapsed_timer.timeout.connect(self._tick_elapsed)
+        self.elapsed_timer.start(1000)
 
-        self.url_var = tk.StringVar()
-        self.model_var = tk.StringVar(value=self.settings.model)
-        self.language_var = tk.StringVar(
-            value=LANGUAGE_VALUES.get(self.settings.language, "自动检测")
-        )
-        self.output_var = tk.StringVar(value=str(self.settings.output_root))
-        self.keep_audio_var = tk.BooleanVar(value=self.settings.keep_audio)
-        self.overwrite_var = tk.BooleanVar(value=self.settings.overwrite)
-        self.open_output_var = tk.BooleanVar(value=self.settings.open_output)
-        self.status_var = tk.StringVar(value="就绪")
-        self.elapsed_var = tk.StringVar(value="已用时间：00:00")
-        self.advanced_visible = tk.BooleanVar(value=False)
-        self.stage_vars = {
-            stage: tk.StringVar(value=f"○ {STAGE_LABELS[stage]}") for stage in STAGES
-        }
+    def resize_from_settings(self, geometry: str) -> None:
+        try:
+            width, height = (int(part) for part in geometry.lower().split("x", maxsplit=1))
+        except (TypeError, ValueError):
+            width, height = 900, 760
+        self.resize(max(width, 760), max(height, 640))
 
-        self._build_widgets()
-        self.url_entry.focus_set()
-        self.root.bind("<Return>", lambda event: self.start_task())
-        self.root.after(100, self._poll_worker_events)
+    def _build_ui(self) -> None:
+        central = QWidget(self)
+        central.setObjectName("centralSurface")
+        root = QVBoxLayout(central)
+        root.setContentsMargins(26, 16, 26, 16)
+        root.setSpacing(14)
 
-    def _build_widgets(self) -> None:
-        main = ttk.Frame(self.root, padding=16)
-        main.pack(fill="both", expand=True)
-        main.columnconfigure(0, weight=1)
+        header = QHBoxLayout()
+        brand = QVBoxLayout()
+        title = QLabel("VideoText")
+        title.setObjectName("appTitle")
+        subtitle = QLabel("将公开视频转换为文本和字幕")
+        subtitle.setObjectName("muted")
+        brand.addWidget(title)
+        brand.addWidget(subtitle)
+        header.addLayout(brand)
+        header.addStretch(1)
+        self.header_status = QLabel("本地 GPU 转写")
+        self.header_status.setObjectName("badge")
+        header.addWidget(self.header_status, alignment=Qt.AlignmentFlag.AlignVCenter)
+        root.addLayout(header)
 
-        ttk.Label(main, text="视频网址").grid(row=0, column=0, sticky="w")
-        self.url_entry = ttk.Entry(main, textvariable=self.url_var)
-        self.url_entry.grid(row=1, column=0, sticky="ew", pady=(4, 10))
+        input_card = QFrame()
+        input_card.setObjectName("card")
+        input_layout = QVBoxLayout(input_card)
+        input_layout.setContentsMargins(22, 20, 22, 20)
+        input_layout.setSpacing(12)
+        input_heading = QLabel("视频链接")
+        input_heading.setObjectName("sectionTitle")
+        input_hint = QLabel("支持 Bilibili、抖音和 YouTube 的公开视频链接")
+        input_hint.setObjectName("muted")
+        input_layout.addWidget(input_heading)
+        input_layout.addWidget(input_hint)
 
-        buttons = ttk.Frame(main)
-        buttons.grid(row=2, column=0, sticky="ew")
-        self.start_button = ttk.Button(buttons, text="开始转换", command=self.start_task)
-        self.start_button.pack(side="left")
-        self.clear_button = ttk.Button(
-            buttons, text="清空", command=lambda: self.url_var.set("")
-        )
-        self.clear_button.pack(side="left", padx=8)
-        self.stop_button = ttk.Button(
-            buttons, text="停止任务", command=self.stop_task, state="disabled"
-        )
-        self.stop_button.pack(side="right")
+        url_row = QHBoxLayout()
+        self.url_entry = QLineEdit()
+        self.url_entry.setPlaceholderText("粘贴或输入视频网址")
+        self.url_entry.setClearButtonEnabled(True)
+        self.url_entry.returnPressed.connect(self.start_task)
+        self.paste_button = QPushButton("粘贴")
+        self.paste_button.setObjectName("secondaryButton")
+        self.paste_button.clicked.connect(self.paste_url)
+        url_row.addWidget(self.url_entry, 1)
+        url_row.addWidget(self.paste_button)
+        input_layout.addLayout(url_row)
 
-        ttk.Checkbutton(
-            main,
-            text="高级设置",
-            variable=self.advanced_visible,
-            command=self._toggle_advanced,
-        ).grid(row=3, column=0, sticky="w", pady=(12, 4))
-        self.advanced_frame = ttk.LabelFrame(main, text="高级设置", padding=10)
-        self._build_advanced(self.advanced_frame)
+        action_row = QHBoxLayout()
+        self.start_button = QPushButton("开始转换")
+        self.start_button.setObjectName("primaryButton")
+        self.start_button.clicked.connect(self.start_task)
+        self.stop_button = QPushButton("停止任务")
+        self.stop_button.setObjectName("dangerButton")
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self.stop_task)
+        self.advanced_button = QPushButton("高级设置")
+        self.advanced_button.setObjectName("textButton")
+        self.advanced_button.clicked.connect(self._open_advanced_settings)
+        action_row.addWidget(self.start_button)
+        action_row.addWidget(self.stop_button)
+        action_row.addWidget(self.advanced_button)
+        action_row.addStretch(1)
+        input_layout.addLayout(action_row)
 
-        self.progress = ttk.Progressbar(main, mode="indeterminate")
-        self.progress.grid(row=5, column=0, sticky="ew", pady=(12, 4))
-        status = ttk.Frame(main)
-        status.grid(row=6, column=0, sticky="ew")
-        ttk.Label(status, textvariable=self.status_var).pack(side="left")
-        ttk.Label(status, textvariable=self.elapsed_var).pack(side="right")
+        self.advanced_dialog = QDialog(self)
+        self.advanced_dialog.setWindowTitle("VideoText 高级设置")
+        self.advanced_dialog.setMinimumWidth(700)
+        self.advanced_dialog.setModal(False)
+        dialog_layout = QVBoxLayout(self.advanced_dialog)
+        dialog_layout.setContentsMargins(20, 18, 20, 18)
+        dialog_layout.setSpacing(12)
+        dialog_title = QLabel("转换选项")
+        dialog_title.setObjectName("sectionTitle")
+        dialog_layout.addWidget(dialog_title)
 
-        stages = ttk.Frame(main)
-        stages.grid(row=7, column=0, sticky="ew", pady=8)
-        for stage in STAGES:
-            ttk.Label(stages, textvariable=self.stage_vars[stage]).pack(
-                side="left", padx=(0, 12)
-            )
+        self.advanced_frame = QFrame(self.advanced_dialog)
+        self.advanced_frame.setObjectName("advancedPanel")
+        advanced = QVBoxLayout(self.advanced_frame)
+        advanced.setContentsMargins(12, 10, 12, 10)
+        advanced.setSpacing(8)
+        self.model_box = QComboBox()
+        self.model_box.addItems(("large-v3-turbo", "medium"))
+        self.model_box.setCurrentText(self.settings.model)
+        self.language_box = QComboBox()
+        self.language_box.addItems(tuple(LANGUAGE_LABELS))
+        self.language_box.setCurrentText(LANGUAGE_VALUES.get(self.settings.language, "自动检测"))
+        self.output_entry = QLineEdit(str(self.settings.output_root))
+        for control in (self.model_box, self.language_box, self.output_entry):
+            control.setMinimumHeight(36)
+        self.choose_output_button = QPushButton("选择…")
+        self.choose_output_button.setObjectName("secondaryButton")
+        self.choose_output_button.clicked.connect(self.choose_output)
+        self.keep_audio_check = ClearCheckBox("保留音频文件")
+        self.keep_audio_check.setChecked(self.settings.keep_audio)
+        self.overwrite_check = ClearCheckBox("覆盖已有结果")
+        self.overwrite_check.setChecked(self.settings.overwrite)
+        self.open_output_check = ClearCheckBox("完成后打开输出目录")
+        self.open_output_check.setChecked(self.settings.open_output)
+        fields_row = QHBoxLayout()
+        fields_row.setSpacing(10)
+        model_label = QLabel("识别模型")
+        model_label.setMinimumWidth(64)
+        language_label = QLabel("转写语言")
+        language_label.setMinimumWidth(64)
+        fields_row.addWidget(model_label)
+        fields_row.addWidget(self.model_box, 1)
+        fields_row.addWidget(language_label)
+        fields_row.addWidget(self.language_box, 1)
+        advanced.addLayout(fields_row)
 
-        self.log = tk.Text(main, height=8, state="disabled", wrap="word")
-        self.log.grid(row=8, column=0, sticky="nsew")
-        main.rowconfigure(8, weight=1)
+        output_row = QHBoxLayout()
+        output_row.setSpacing(10)
+        output_label = QLabel("输出目录")
+        output_label.setMinimumWidth(64)
+        output_row.addWidget(output_label)
+        output_row.addWidget(self.output_entry, 1)
+        output_row.addWidget(self.choose_output_button)
+        advanced.addLayout(output_row)
 
-        results = ttk.Frame(main)
-        results.grid(row=9, column=0, sticky="ew", pady=(10, 0))
-        self.open_dir_button = ttk.Button(
-            results,
-            text="打开输出目录",
-            command=self.open_output_dir,
-            state="disabled",
-        )
-        self.open_dir_button.pack(side="left")
-        self.open_txt_button = ttk.Button(
-            results, text="打开 TXT", command=self.open_txt, state="disabled"
-        )
-        self.open_txt_button.pack(side="left", padx=8)
-        ttk.Button(results, text="复制详细信息", command=self.copy_detail).pack(side="right")
+        options_row = QHBoxLayout()
+        options_row.setSpacing(16)
+        options_row.addWidget(self.keep_audio_check)
+        options_row.addWidget(self.overwrite_check)
+        options_row.addWidget(self.open_output_check)
+        options_row.addStretch(1)
+        advanced.addLayout(options_row)
+        dialog_layout.addWidget(self.advanced_frame)
+        dialog_buttons = QHBoxLayout()
+        dialog_buttons.addStretch(1)
+        close_settings_button = QPushButton("完成")
+        close_settings_button.setObjectName("primaryButton")
+        close_settings_button.clicked.connect(self.advanced_dialog.accept)
+        dialog_buttons.addWidget(close_settings_button)
+        dialog_layout.addLayout(dialog_buttons)
+        root.addWidget(input_card)
 
-    def _build_advanced(self, frame: ttk.LabelFrame) -> None:
-        ttk.Label(frame, text="模型").grid(row=0, column=0, sticky="w")
-        self.model_box = ttk.Combobox(
-            frame,
-            textvariable=self.model_var,
-            values=("large-v3-turbo", "medium"),
-            state="readonly",
-        )
-        self.model_box.grid(row=0, column=1, sticky="ew", padx=8)
-        ttk.Label(frame, text="语言").grid(row=0, column=2, sticky="w")
-        self.language_box = ttk.Combobox(
-            frame,
-            textvariable=self.language_var,
-            values=tuple(LANGUAGE_LABELS),
-            state="readonly",
-        )
-        self.language_box.grid(row=0, column=3, sticky="ew", padx=8)
-        ttk.Label(frame, text="输出目录").grid(row=1, column=0, sticky="w", pady=8)
-        self.output_entry = ttk.Entry(frame, textvariable=self.output_var)
-        self.output_entry.grid(row=1, column=1, columnspan=2, sticky="ew", padx=8)
-        self.choose_output_button = ttk.Button(
-            frame, text="选择", command=self.choose_output
-        )
-        self.choose_output_button.grid(row=1, column=3)
-        self.keep_audio_check = ttk.Checkbutton(
-            frame, text="保留音频", variable=self.keep_audio_var
-        )
-        self.keep_audio_check.grid(row=2, column=0, sticky="w")
-        self.overwrite_check = ttk.Checkbutton(
-            frame, text="覆盖已有结果", variable=self.overwrite_var
-        )
-        self.overwrite_check.grid(row=2, column=1, sticky="w")
-        self.open_output_check = ttk.Checkbutton(
-            frame, text="完成后打开目录", variable=self.open_output_var
-        )
-        self.open_output_check.grid(row=2, column=2, sticky="w")
-        frame.columnconfigure(1, weight=1)
+        progress_card = QFrame()
+        progress_card.setObjectName("card")
+        progress_layout = QVBoxLayout(progress_card)
+        progress_layout.setContentsMargins(22, 18, 22, 18)
+        progress_layout.setSpacing(14)
+        progress_top = QHBoxLayout()
+        progress_title = QLabel("转换进度")
+        progress_title.setObjectName("sectionTitle")
+        self.elapsed_label = QLabel("00:00")
+        self.elapsed_label.setObjectName("muted")
+        progress_top.addWidget(progress_title)
+        progress_top.addStretch(1)
+        progress_top.addWidget(QLabel("已用时间"))
+        progress_top.addWidget(self.elapsed_label)
+        progress_layout.addLayout(progress_top)
+        self.stage_labels: dict[str, QLabel] = {}
+        stage_row = QHBoxLayout()
+        stage_row.setSpacing(8)
+        for index, stage in enumerate(STAGES):
+            label = QLabel(f"○  {STAGE_LABELS[stage]}")
+            label.setObjectName("stage")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.stage_labels[stage] = label
+            stage_row.addWidget(label, 1)
+            if index < len(STAGES) - 1:
+                separator = QLabel("›")
+                separator.setObjectName("muted")
+                stage_row.addWidget(separator)
+        progress_layout.addLayout(stage_row)
+        self.status_label = QLabel("就绪，粘贴视频链接后开始转换。")
+        self.status_label.setObjectName("status")
+        progress_layout.addWidget(self.status_label)
+        root.addWidget(progress_card)
 
-    def _toggle_advanced(self) -> None:
-        if self.advanced_visible.get():
-            self.advanced_frame.grid(row=4, column=0, sticky="ew")
-        else:
-            self.advanced_frame.grid_remove()
+        self.content_card = QFrame()
+        self.content_card.setObjectName("card")
+        content_layout = QVBoxLayout(self.content_card)
+        content_layout.setContentsMargins(22, 18, 22, 18)
+        content_layout.setSpacing(10)
+        content_header = QHBoxLayout()
+        self.content_title = QLabel("任务信息")
+        self.content_title.setObjectName("sectionTitle")
+        self.copy_detail_button = QPushButton("复制诊断信息")
+        self.copy_detail_button.setObjectName("textButton")
+        self.copy_detail_button.clicked.connect(self.copy_detail)
+        content_header.addWidget(self.content_title)
+        content_header.addStretch(1)
+        content_header.addWidget(self.copy_detail_button)
+        content_layout.addLayout(content_header)
+        self.idle_hint = QLabel("完成后将在这里显示转写结果位置和处理日志。\n结果包含 TXT、SRT 和 JSON 文件。")
+        self.idle_hint.setObjectName("emptyHint")
+        self.idle_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        content_layout.addWidget(self.idle_hint, 1)
+        self.result_summary = QLabel("")
+        self.result_summary.setObjectName("resultSummary")
+        self.result_summary.setWordWrap(True)
+        self.result_summary.hide()
+        content_layout.addWidget(self.result_summary)
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setPlaceholderText("任务运行日志将显示在这里")
+        self.log.setMinimumHeight(100)
+        self.log.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.log.hide()
+        content_layout.addWidget(self.log, 1)
+        root.addWidget(self.content_card, 1)
+
+        results = QHBoxLayout()
+        self.open_dir_button = QPushButton("打开输出目录")
+        self.open_dir_button.setObjectName("secondaryButton")
+        self.open_dir_button.setEnabled(False)
+        self.open_dir_button.clicked.connect(self.open_output_dir)
+        self.open_txt_button = QPushButton("打开 TXT")
+        self.open_txt_button.setObjectName("secondaryButton")
+        self.open_txt_button.setEnabled(False)
+        self.open_txt_button.clicked.connect(self.open_txt)
+        self.open_srt_button = QPushButton("打开 SRT")
+        self.open_srt_button.setObjectName("secondaryButton")
+        self.open_srt_button.setEnabled(False)
+        self.open_srt_button.clicked.connect(self.open_srt)
+        results.addWidget(self.open_dir_button)
+        results.addWidget(self.open_txt_button)
+        results.addWidget(self.open_srt_button)
+        results.addStretch(1)
+        root.addLayout(results)
+
+        self.scroll_area = QScrollArea(self)
+        self.scroll_area.setObjectName("mainScrollArea")
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll_area.setWidget(central)
+        self.setCentralWidget(self.scroll_area)
+
+    def _apply_style(self) -> None:
+        self.setFont(QFont("Microsoft YaHei UI", 10))
+        self.setStyleSheet("""
+            QMainWindow, QWidget#centralSurface { background: #f4f6fa; color: #20283a; }
+            QScrollArea#mainScrollArea { background: #f4f6fa; }
+            QFrame#card { background: #ffffff; border: 1px solid #e5e9f1; border-radius: 14px; }
+            QFrame#advancedPanel { background: #f7f9fc; border: 1px solid #e8edf5; border-radius: 10px; }
+            QLabel#appTitle { font-size: 23px; font-weight: 700; color: #17233b; }
+            QLabel#sectionTitle { font-size: 14px; font-weight: 650; color: #263550; }
+            QLabel#muted { color: #7a8497; }
+            QLabel#badge { color: #3567bd; background: #eaf1ff; border-radius: 10px; padding: 8px 12px; }
+            QLabel#status { color: #5c6678; padding-top: 2px; }
+            QLabel#stage { color: #8791a2; background: #f6f7fa; border-radius: 8px; padding: 10px 6px; }
+            QLabel#stage[active="true"] { color: #245bb5; background: #eaf1ff; font-weight: 650; }
+            QLabel#stage[done="true"] { color: #25805b; background: #eaf7f1; }
+            QLabel#emptyHint { color: #929bad; line-height: 1.5; }
+            QLabel#resultSummary { color: #276b4b; background: #eef8f2; border-radius: 8px; padding: 12px; }
+            QLineEdit, QComboBox, QPlainTextEdit { background: #ffffff; border: 1px solid #dce2ec; border-radius: 8px; selection-background-color: #3974d2; }
+            QLineEdit { min-height: 40px; padding: 0 12px; }
+            QComboBox { min-height: 40px; padding: 0 10px; }
+            QPlainTextEdit { padding: 10px 12px; }
+            QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus { border: 1px solid #6b96e2; }
+            QPushButton { border: 0; border-radius: 8px; padding: 10px 16px; font-weight: 600; }
+            QPushButton#primaryButton { color: white; background: #3473d1; min-width: 120px; }
+            QPushButton#primaryButton:hover { background: #2864bf; }
+            QPushButton#primaryButton:disabled { background: #aabbd7; }
+            QPushButton#secondaryButton { color: #33425a; background: #edf1f7; }
+            QPushButton#secondaryButton:hover { background: #e2e8f1; }
+            QPushButton#dangerButton { color: #a53e45; background: #fff0f0; border: 1px solid transparent; }
+            QPushButton#dangerButton:hover:!disabled { color: #96343b; background: #ffe1e3; border-color: #f2bfc3; }
+            QPushButton#dangerButton:pressed:!disabled { color: #852b32; background: #ffd3d6; border-color: #edb0b5; }
+            QPushButton#dangerButton:disabled { color: #c1a6a8; background: #f7f3f3; border-color: transparent; }
+            QPushButton#textButton { color: #52627c; background: transparent; }
+            QPushButton#textButton:hover { background: #edf1f7; }
+            QCheckBox { spacing: 8px; color: #4b5669; }
+        """)
+
+    def _open_advanced_settings(self) -> None:
+        self.advanced_dialog.show()
+        self.advanced_dialog.raise_()
+        self.advanced_dialog.activateWindow()
 
     def current_settings(self) -> GuiSettings:
         return GuiSettings(
-            model=self.model_var.get(),
-            language=LANGUAGE_LABELS[self.language_var.get()],
-            output_root=Path(self.output_var.get()).expanduser(),
-            keep_audio=self.keep_audio_var.get(),
-            overwrite=self.overwrite_var.get(),
-            open_output=self.open_output_var.get(),
-            geometry=self.root.geometry(),
+            model=self.model_box.currentText(),
+            language=LANGUAGE_LABELS[self.language_box.currentText()],
+            output_root=Path(self.output_entry.text()).expanduser(),
+            keep_audio=self.keep_audio_check.isChecked(),
+            overwrite=self.overwrite_check.isChecked(),
+            open_output=self.open_output_check.isChecked(),
+            geometry=f"{self.width()}x{self.height()}",
         )
+
+    def paste_url(self) -> None:
+        clipboard_text = QApplication.clipboard().text().strip()
+        if clipboard_text:
+            self.url_entry.setText(clipboard_text)
+            self.url_entry.setFocus()
 
     def start_task(self) -> None:
         if self.controller.is_running:
             return
         try:
-            url = validate_url(self.url_var.get().strip())
+            url = validate_url(self.url_entry.text().strip())
         except VideoTextError as exc:
-            messagebox.showerror("网址无效", str(exc), parent=self.root)
+            self.status_label.setText(str(exc))
+            self.url_entry.setFocus()
+            self.url_entry.setStyleSheet("border: 1px solid #d45b62;")
             return
+        self.url_entry.setStyleSheet("")
         settings = self.current_settings()
         saved, detail = attempt_start(lambda: save_settings(self.settings_path, settings))
         if not saved:
@@ -255,13 +504,17 @@ class VideoTextApp:
         request = build_request(task_id, url, settings, temp_root)
         self.active_task_id = task_id
         self._set_running(True)
-        self.status_var.set("正在启动工作进程")
+        self.status_label.setText("正在启动工作进程…")
         self.started_at = time.monotonic()
         self.last_paths = []
         self.last_detail = ""
         self.terminal_message_received = False
         self.closing = False
         self._reset_stages()
+        self.idle_hint.hide()
+        self.result_summary.hide()
+        self.log.clear()
+        self.log.show()
         started, detail = attempt_start(
             lambda: self.controller.start(
                 request,
@@ -273,53 +526,51 @@ class VideoTextApp:
             self.active_task_id = None
             cleanup_failed_start(request.temp_root)
             self._handle_start_failure(detail)
-            return
-        self._tick_elapsed()
 
-    def _handle_start_failure(
-        self, detail: str, summary: str = "无法启动转写工作进程。"
-    ) -> None:
+    def _handle_start_failure(self, detail: str, summary: str = "无法启动转写工作进程。") -> None:
         self._set_running(False)
         self.started_at = None
         self.last_detail = detail
-        self.status_var.set("启动失败")
-        messagebox.showerror(
-            "启动失败",
-            f"{summary}\n\n{detail}",
-            parent=self.root,
-        )
+        self.status_label.setText(summary)
+        self.log.appendPlainText(f"{summary}\n{detail}")
+        self.log.show()
 
     def handle_message(self, message: dict[str, object]) -> None:
         message_type = message.get("type")
         if message_type == "started":
-            self.status_var.set("工作进程已启动")
-            self._append_log(self.status_var.get())
+            self.status_label.setText("工作进程已启动，正在准备任务。")
+            self._append_log("工作进程已启动")
         elif message_type == "progress":
-            stage = str(message["stage"])
-            self.status_var.set(str(message.get("message", STAGE_LABELS.get(stage, stage))))
-            self._render_stages(stage)
-            self._append_log(self.status_var.get())
+            stage = str(message.get("stage", ""))
+            description = str(message.get("message", STAGE_LABELS.get(stage, stage)))
+            self.status_label.setText(description)
+            if stage in STAGES:
+                self._render_stages(stage)
+            self._append_log(description)
         elif message_type == "completed":
             self.terminal_message_received = True
             self.last_paths = [Path(value) for value in message.get("paths", [])]
-            self.status_var.set("处理完成")
-            self.open_dir_button.configure(state="normal")
-            if any(path.name == "transcript.txt" for path in self.last_paths):
-                self.open_txt_button.configure(state="normal")
-            if self.open_output_var.get():
+            self.status_label.setText("转换完成")
+            self._render_stages("done")
+            self.open_dir_button.setEnabled(True)
+            self.open_txt_button.setEnabled(any(path.name == "transcript.txt" for path in self.last_paths))
+            self.open_srt_button.setEnabled(any(path.name == "transcript.srt" for path in self.last_paths))
+            names = "、".join(path.name for path in self.last_paths)
+            location = self.last_paths[0].parent if self.last_paths else self.output_entry.text()
+            self.result_summary.setText(f"已生成：{names}\n保存位置：{location}")
+            self.result_summary.show()
+            if self.open_output_check.isChecked():
                 self.open_output_dir()
         elif message_type == "error":
             self.terminal_message_received = True
             self.last_detail = str(message.get("diagnostic", ""))
             if message.get("code") == "CancelledError":
-                self.status_var.set("任务已停止")
+                self.status_label.setText("任务已停止")
             else:
-                self.status_var.set("转换失败")
-                messagebox.showerror(
-                    "转换失败",
-                    f"{message.get('message', '未知错误')}\n\n{message.get('hint', '')}",
-                    parent=self.root,
-                )
+                summary = str(message.get("message", "未知错误"))
+                hint = str(message.get("hint", ""))
+                self.status_label.setText(f"转换失败：{summary}")
+                self._append_log(f"{summary}\n{hint}".strip())
         elif message_type == "diagnostic":
             self.last_detail += "\n" + str(message.get("message", ""))
 
@@ -327,27 +578,18 @@ class VideoTextApp:
         self.active_task_id = None
         self.started_at = None
         self._set_running(False)
-        self.last_detail += "\n" + result.detail
+        self.last_detail = (self.last_detail + "\n" + result.detail).strip()
         LOGGER.info("工作进程退出：return_code=%s", result.return_code)
         if self.closing:
             save_settings(self.settings_path, self.current_settings())
-            self.destroyed = True
-            self.root.destroy()
+            self.close()
             return
         if result.crashed:
-            self.status_var.set("GPU 转写进程异常退出")
-            messagebox.showerror(
-                "转写进程异常退出",
-                f"工作进程退出码：{result.return_code}\n请复制详细信息检查。",
-                parent=self.root,
-            )
+            self.status_label.setText("GPU 转写进程异常退出")
+            self._append_log(f"工作进程退出码：{result.return_code}。请复制诊断信息检查。")
         elif result.return_code != 0 and not self.terminal_message_received:
-            self.status_var.set("工作进程异常结束")
-            messagebox.showerror(
-                "工作进程异常结束",
-                f"退出码：{result.return_code}\n工作进程未返回错误消息，请复制详细信息检查。",
-                parent=self.root,
-            )
+            self.status_label.setText("工作进程异常结束")
+            self._append_log(f"退出码：{result.return_code}。工作进程未返回错误消息。")
 
     def _poll_worker_events(self) -> None:
         try:
@@ -361,101 +603,121 @@ class VideoTextApp:
             detail = traceback.format_exc()
             LOGGER.exception("处理工作进程事件失败")
             self.last_detail = (self.last_detail + "\n" + detail).strip()
-            self.status_var.set("界面处理工作进程消息失败")
+            self.status_label.setText("界面处理工作进程消息失败，任务已停止。")
             if self.controller.is_running:
                 self.controller.cancel()
             self._set_running(False)
-            messagebox.showerror(
-                "界面消息处理失败",
-                "工作进程消息无法显示，任务已停止。请复制详细信息检查。",
-                parent=self.root,
-            )
-        finally:
-            if not self.destroyed:
-                self.root.after(100, self._poll_worker_events)
+            self._append_log("请复制诊断信息检查。")
 
     def stop_task(self) -> None:
         if self.controller.is_running:
-            self.status_var.set("正在停止任务…")
+            self.status_label.setText("正在停止任务…")
             self.controller.cancel()
 
     def _set_running(self, running: bool) -> None:
-        self.start_button.configure(state="disabled" if running else "normal")
-        self.clear_button.configure(state="disabled" if running else "normal")
-        self.stop_button.configure(state="normal" if running else "disabled")
-        self.url_entry.configure(state="disabled" if running else "normal")
-        self.model_box.configure(state="disabled" if running else "readonly")
-        self.language_box.configure(state="disabled" if running else "readonly")
-        self.output_entry.configure(state="disabled" if running else "normal")
-        self.choose_output_button.configure(state="disabled" if running else "normal")
-        option_state = "disabled" if running else "normal"
-        self.keep_audio_check.configure(state=option_state)
-        self.overwrite_check.configure(state=option_state)
-        self.open_output_check.configure(state=option_state)
+        for widget in (
+            self.url_entry,
+            self.paste_button,
+            self.advanced_button,
+            self.model_box,
+            self.language_box,
+            self.output_entry,
+            self.choose_output_button,
+            self.keep_audio_check,
+            self.overwrite_check,
+            self.open_output_check,
+        ):
+            widget.setEnabled(not running)
+        self.start_button.setEnabled(not running)
+        self.stop_button.setEnabled(running)
         if running:
-            self.progress.start(10)
-        else:
-            self.progress.stop()
+            self.open_dir_button.setEnabled(False)
+            self.open_txt_button.setEnabled(False)
+            self.open_srt_button.setEnabled(False)
 
     def _tick_elapsed(self) -> None:
-        if not self.controller.is_running or self.started_at is None:
+        if self.started_at is None:
             return
         seconds = int(time.monotonic() - self.started_at)
-        self.elapsed_var.set(f"已用时间：{seconds // 60:02}:{seconds % 60:02}")
-        self.root.after(1000, self._tick_elapsed)
+        self.elapsed_label.setText(f"{seconds // 60:02}:{seconds % 60:02}")
 
     def _reset_stages(self) -> None:
-        for stage in STAGES:
-            self.stage_vars[stage].set(f"○ {STAGE_LABELS[stage]}")
+        for label in self.stage_labels.values():
+            label.setText("○  " + label.text().split("  ", maxsplit=1)[-1])
+            label.setProperty("active", False)
+            label.setProperty("done", False)
+            label.style().unpolish(label)
+            label.style().polish(label)
 
     def _render_stages(self, active: str) -> None:
         for stage, state in stage_status(active).items():
+            label = self.stage_labels[stage]
             marker = {"done": "✓", "active": "●", "pending": "○"}[state]
-            self.stage_vars[stage].set(f"{marker} {STAGE_LABELS[stage]}")
+            label.setText(f"{marker}  {STAGE_LABELS[stage]}")
+            label.setProperty("active", state == "active")
+            label.setProperty("done", state == "done")
+            label.style().unpolish(label)
+            label.style().polish(label)
 
     def _append_log(self, line: str) -> None:
-        self.log.configure(state="normal")
-        self.log.insert("end", line + "\n")
-        self.log.see("end")
-        self.log.configure(state="disabled")
+        self.idle_hint.hide()
+        self.log.show()
+        self.log.appendPlainText(line)
 
     def choose_output(self) -> None:
-        selected = filedialog.askdirectory(
-            initialdir=self.output_var.get(), parent=self.root
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "选择输出目录",
+            self.output_entry.text(),
+            QFileDialog.Option.ShowDirsOnly,
         )
         if selected:
-            self.output_var.set(selected)
+            self.output_entry.setText(selected)
 
     def open_output_dir(self) -> None:
-        directory = self.last_paths[0].parent if self.last_paths else Path(self.output_var.get())
+        directory = self.last_paths[0].parent if self.last_paths else Path(self.output_entry.text())
         directory.mkdir(parents=True, exist_ok=True)
         os.startfile(directory)  # type: ignore[attr-defined]
 
-    def open_txt(self) -> None:
+    def _open_result(self, name: str) -> None:
         for path in self.last_paths:
-            if path.name == "transcript.txt" and path.is_file():
+            if path.name == name and path.is_file():
                 os.startfile(path)  # type: ignore[attr-defined]
                 return
 
-    def copy_detail(self) -> None:
-        self.root.clipboard_clear()
-        self.root.clipboard_append(self.last_detail or self.log.get("1.0", "end").strip())
+    def open_txt(self) -> None:
+        self._open_result("transcript.txt")
 
-    def on_close(self) -> None:
-        if self.controller.is_running and not messagebox.askyesno(
-            "任务仍在运行",
-            "关闭将停止当前转换。是否继续？",
-            parent=self.root,
-        ):
-            return
-        if self.controller.is_running:
+    def open_srt(self) -> None:
+        self._open_result("transcript.srt")
+
+    def copy_detail(self) -> None:
+        detail = self.last_detail or self.log.toPlainText() or self.status_label.text()
+        QApplication.clipboard().setText(detail)
+        self.statusBar().showMessage("诊断信息已复制", 2500)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self.controller.is_running and not self.closing:
+            answer = QMessageBox.question(
+                self,
+                "任务仍在运行",
+                "关闭将停止当前转换。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
             self.closing = True
-            self.status_var.set("正在停止任务并关闭…")
+            self.status_label.setText("正在停止任务并关闭…")
             self.controller.cancel()
+            event.ignore()
             return
         save_settings(self.settings_path, self.current_settings())
-        self.destroyed = True
-        self.root.destroy()
+        self._destroyed = True
+        self.event_timer.stop()
+        self.elapsed_timer.stop()
+        event.accept()
 
 
 def configure_logging(app_data: Path) -> None:
@@ -474,9 +736,12 @@ def main() -> None:
     project_root = Path(__file__).resolve().parents[2]
     app_data = Path(os.environ.get("LOCALAPPDATA", project_root))
     configure_logging(app_data)
-    root = tk.Tk()
-    VideoTextApp(root, WorkerProcess(), project_root, app_data)
-    root.mainloop()
+    app = QApplication.instance() or QApplication([])
+    app.setApplicationName("VideoText")
+    app.setOrganizationName("VideoText")
+    window = VideoTextWindow(WorkerProcess(), project_root, app_data)
+    window.show()
+    raise SystemExit(app.exec())
 
 
 if __name__ == "__main__":

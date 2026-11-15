@@ -29,7 +29,7 @@ def default_settings(project_root: Path) -> GuiSettings:
         language=None,
         output_root=project_root / "outputs",
         keep_audio=False,
-        overwrite=False,
+        overwrite=True,
         open_output=True,
         geometry="820x620",
     )
