@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.25,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "videotext"
+version = "0.1.0"
+description = "Transcribe public video links locally with faster-whisper"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "faster-whisper>=1.1,<2",
+  "rich>=13,<15",
+  "typer>=0.12,<1",
+  "yt-dlp>=2025.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4,<10", "ruff>=0.9,<1"]
+
+[project.scripts]
+videotext = "videotext.cli:app"
+videotext-gui = "videotext.gui:main"
+videotext-worker = "videotext.worker:main"
+
+[tool.hatch.build]
+exclude = [
+  "/.venv",
+  "/.venv-anaconda-backup",
+  "/.pytest_cache",
+  "/outputs",
+]
+skip-excluded-dirs = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/videotext"]
+only-packages = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
