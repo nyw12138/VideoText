@@ -11,10 +11,20 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import QRect, QSize, Qt, QTimer
-from PySide6.QtGui import QCloseEvent, QColor, QFont, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QCloseEvent,
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QFont,
+    QPainter,
+    QPainterPath,
+    QPen,
+)
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -29,23 +39,24 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from .errors import VideoTextError
+from .errors import InputError, VideoTextError
 from .gui_controller import WorkerExit, WorkerProcess
 from .gui_events import WorkerEventQueue, dispatch_worker_events
 from .protocol import WorkerRequest
 from .settings import GuiSettings, load_settings, save_settings
-from .validation import validate_url
+from .validation import validate_local_file, validate_url
 
 LANGUAGE_LABELS = {"自动检测": None, "中文": "zh", "英文": "en"}
 LANGUAGE_VALUES = {value: label for label, value in LANGUAGE_LABELS.items()}
 STAGES = ("probe", "download", "normalize", "transcribe", "export")
 STAGE_LABELS = {
     "probe": "读取媒体信息",
-    "download": "下载音频",
+    "download": "获取音轨",
     "normalize": "标准化音频",
     "transcribe": "GPU 转写",
     "export": "写入结果",
@@ -55,7 +66,12 @@ LOGGER = logging.getLogger(__name__)
 
 
 def build_request(
-    task_id: str, url: str, settings: GuiSettings, temp_root: Path
+    task_id: str,
+    url: str,
+    settings: GuiSettings,
+    temp_root: Path,
+    input_type: str = "url",
+    file_path: Path | None = None,
 ) -> WorkerRequest:
     return WorkerRequest(
         task_id=task_id,
@@ -66,6 +82,8 @@ def build_request(
         language=settings.language,
         keep_audio=settings.keep_audio,
         overwrite=settings.overwrite,
+        input_type=input_type,
+        file_path=file_path,
     )
 
 
@@ -153,6 +171,53 @@ class ClearCheckBox(QCheckBox):
         painter.drawText(label_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text())
 
 
+class MediaFileDropArea(QFrame):
+    fileDropped = Signal(str)
+    fileRequested = Signal()
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("fileDropArea")
+        self.setAcceptDrops(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.fileRequested.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        urls = event.mimeData().urls()
+        if len(urls) == 1 and urls[0].isLocalFile() and Path(urls[0].toLocalFile()).is_file():
+            self.setProperty("dragging", True)
+            self.style().unpolish(self)
+            self.style().polish(self)
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:
+        self.setProperty("dragging", False)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        event.accept()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        self.setProperty("dragging", False)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        urls = event.mimeData().urls()
+        if len(urls) == 1 and urls[0].isLocalFile():
+            path = Path(urls[0].toLocalFile())
+            if path.is_file():
+                self.fileDropped.emit(str(path))
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+
 class VideoTextWindow(QMainWindow):
     def __init__(
         self,
@@ -175,7 +240,7 @@ class VideoTextWindow(QMainWindow):
         self.worker_events = WorkerEventQueue()
         self._destroyed = False
 
-        self.setWindowTitle("VideoText 视频转文字")
+        self.setWindowTitle("VideoText 视频音频转写系统")
         self.setMinimumSize(780, 620)
         self.resize_from_settings(self.settings.geometry)
         self._build_ui()
@@ -206,7 +271,7 @@ class VideoTextWindow(QMainWindow):
         brand = QVBoxLayout()
         title = QLabel("VideoText")
         title.setObjectName("appTitle")
-        subtitle = QLabel("将公开视频转换为文本和字幕")
+        subtitle = QLabel("将视频或音频转换为文本和字幕")
         subtitle.setObjectName("muted")
         brand.addWidget(title)
         brand.addWidget(subtitle)
@@ -222,14 +287,40 @@ class VideoTextWindow(QMainWindow):
         input_layout = QVBoxLayout(input_card)
         input_layout.setContentsMargins(22, 20, 22, 20)
         input_layout.setSpacing(12)
-        input_heading = QLabel("视频链接")
+        input_heading = QLabel("媒体来源")
         input_heading.setObjectName("sectionTitle")
-        input_hint = QLabel("支持 Bilibili、抖音和 YouTube 的公开视频链接")
-        input_hint.setObjectName("muted")
-        input_layout.addWidget(input_heading)
-        input_layout.addWidget(input_hint)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(input_heading)
+        mode_row.addStretch(1)
+        self.input_mode_group = QButtonGroup(self)
+        self.input_mode_group.setExclusive(True)
+        self.online_mode_button = QToolButton()
+        self.online_mode_button.setText("在线链接")
+        self.online_mode_button.setObjectName("sourceModeButton")
+        self.online_mode_button.setCheckable(True)
+        self.online_mode_button.setChecked(True)
+        self.file_mode_button = QToolButton()
+        self.file_mode_button.setText("本地文件")
+        self.file_mode_button.setObjectName("sourceModeButton")
+        self.file_mode_button.setCheckable(True)
+        self.input_mode_group.addButton(self.online_mode_button, 0)
+        self.input_mode_group.addButton(self.file_mode_button, 1)
+        mode_switch = QFrame()
+        mode_switch.setObjectName("sourceModeSwitch")
+        mode_switch_layout = QHBoxLayout(mode_switch)
+        mode_switch_layout.setContentsMargins(3, 3, 3, 3)
+        mode_switch_layout.setSpacing(2)
+        mode_switch_layout.addWidget(self.online_mode_button)
+        mode_switch_layout.addWidget(self.file_mode_button)
+        mode_row.addWidget(mode_switch)
+        input_layout.addLayout(mode_row)
+        self.input_hint = QLabel("支持 Bilibili 和 YouTube 的公开视频")
+        self.input_hint.setObjectName("muted")
+        input_layout.addWidget(self.input_hint)
 
+        self.url_input_row = QWidget()
         url_row = QHBoxLayout()
+        url_row.setContentsMargins(0, 0, 0, 0)
         self.url_entry = QLineEdit()
         self.url_entry.setPlaceholderText("粘贴或输入视频网址")
         self.url_entry.setClearButtonEnabled(True)
@@ -239,7 +330,72 @@ class VideoTextWindow(QMainWindow):
         self.paste_button.clicked.connect(self.paste_url)
         url_row.addWidget(self.url_entry, 1)
         url_row.addWidget(self.paste_button)
-        input_layout.addLayout(url_row)
+        self.url_input_row.setLayout(url_row)
+        input_layout.addWidget(self.url_input_row)
+
+        self.selected_file_path: Path | None = None
+        self.file_input_row = MediaFileDropArea()
+        self.file_input_row.setMinimumHeight(132)
+        self.file_input_row.fileDropped.connect(self._set_selected_file)
+        self.file_input_row.fileRequested.connect(self.choose_input_file)
+        file_row = QVBoxLayout(self.file_input_row)
+        file_row.setContentsMargins(16, 12, 16, 12)
+        file_row.setSpacing(8)
+        self.file_prompt = QWidget()
+        prompt_layout = QVBoxLayout(self.file_prompt)
+        prompt_layout.setContentsMargins(0, 0, 0, 0)
+        prompt_layout.setSpacing(3)
+        prompt_title = QLabel("拖放音频或视频文件到这里")
+        prompt_title.setObjectName("dropTitle")
+        prompt_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        prompt_title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        prompt_hint = QLabel("或点击此处浏览选择文件")
+        prompt_hint.setObjectName("muted")
+        prompt_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        prompt_hint.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        prompt_layout.addWidget(prompt_title)
+        prompt_layout.addWidget(prompt_hint)
+        file_row.addStretch(1)
+        file_row.addWidget(self.file_prompt)
+
+        self.selected_file_card = QWidget()
+        selected_layout = QHBoxLayout(self.selected_file_card)
+        selected_layout.setContentsMargins(8, 4, 8, 4)
+        selected_layout.setSpacing(12)
+        self.selected_file_icon = QLabel("▶")
+        self.selected_file_icon.setObjectName("dropIcon")
+        self.selected_file_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.selected_file_icon.setFixedSize(44, 44)
+        self.selected_file_icon.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.selected_file_icon.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        selected_layout.addWidget(self.selected_file_icon)
+        selected_text = QVBoxLayout()
+        selected_text.setSpacing(3)
+        self.selected_file_name = QLabel("")
+        self.selected_file_name.setObjectName("dropTitle")
+        self.selected_file_name.setWordWrap(True)
+        self.selected_file_name.setMinimumWidth(0)
+        self.selected_file_name.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.selected_file_detail = QLabel("")
+        self.selected_file_detail.setObjectName("muted")
+        self.selected_file_detail.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        selected_text.addWidget(self.selected_file_name)
+        selected_text.addWidget(self.selected_file_detail)
+        selected_layout.addLayout(selected_text, 1)
+        self.replace_file_button = QPushButton("更换")
+        self.replace_file_button.setObjectName("secondaryButton")
+        self.replace_file_button.clicked.connect(self.choose_input_file)
+        self.remove_file_button = QPushButton("移除")
+        self.remove_file_button.setObjectName("textButton")
+        self.remove_file_button.clicked.connect(self.remove_selected_file)
+        selected_layout.addWidget(self.replace_file_button)
+        selected_layout.addWidget(self.remove_file_button)
+        self.selected_file_card.hide()
+        file_row.addWidget(self.selected_file_card)
+        file_row.addStretch(1)
+        self.file_input_row.hide()
+        input_layout.addWidget(self.file_input_row)
+        self.input_mode_group.idClicked.connect(self._on_input_mode_changed)
 
         action_row = QHBoxLayout()
         self.start_button = QPushButton("开始转换")
@@ -250,8 +406,10 @@ class VideoTextWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_task)
         self.advanced_button = QPushButton("高级设置")
-        self.advanced_button.setObjectName("textButton")
+        self.advanced_button.setObjectName("secondaryButton")
         self.advanced_button.clicked.connect(self._open_advanced_settings)
+        for button in (self.start_button, self.stop_button, self.advanced_button):
+            button.setFixedSize(150, 44)
         action_row.addWidget(self.start_button)
         action_row.addWidget(self.stop_button)
         action_row.addWidget(self.advanced_button)
@@ -359,7 +517,7 @@ class VideoTextWindow(QMainWindow):
                 separator.setObjectName("muted")
                 stage_row.addWidget(separator)
         progress_layout.addLayout(stage_row)
-        self.status_label = QLabel("就绪，粘贴视频链接后开始转换。")
+        self.status_label = QLabel("就绪，粘贴视频链接或选择本地媒体文件后开始转换。")
         self.status_label.setObjectName("status")
         progress_layout.addWidget(self.status_label)
         root.addWidget(progress_card)
@@ -383,11 +541,6 @@ class VideoTextWindow(QMainWindow):
         self.idle_hint.setObjectName("emptyHint")
         self.idle_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         content_layout.addWidget(self.idle_hint, 1)
-        self.result_summary = QLabel("")
-        self.result_summary.setObjectName("resultSummary")
-        self.result_summary.setWordWrap(True)
-        self.result_summary.hide()
-        content_layout.addWidget(self.result_summary)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setPlaceholderText("任务运行日志将显示在这里")
@@ -431,16 +584,22 @@ class VideoTextWindow(QMainWindow):
             QScrollArea#mainScrollArea { background: #f4f6fa; }
             QFrame#card { background: #ffffff; border: 1px solid #e5e9f1; border-radius: 14px; }
             QFrame#advancedPanel { background: #f7f9fc; border: 1px solid #e8edf5; border-radius: 10px; }
+            QFrame#sourceModeSwitch { background: #f0f3f8; border-radius: 9px; }
+            QToolButton#sourceModeButton { color: #647188; background: transparent; border: 0; border-radius: 7px; padding: 7px 14px; }
+            QToolButton#sourceModeButton:checked { color: #2d67bf; background: #ffffff; font-weight: 650; }
+            QFrame#fileDropArea { background: #f9fbfe; border: 1px dashed #c8d4e6; border-radius: 10px; }
+            QFrame#fileDropArea[dragging="true"] { background: #eff5ff; border-color: #3473d1; }
             QLabel#appTitle { font-size: 23px; font-weight: 700; color: #17233b; }
             QLabel#sectionTitle { font-size: 14px; font-weight: 650; color: #263550; }
             QLabel#muted { color: #7a8497; }
+            QLabel#dropTitle { color: #34435a; font-weight: 600; }
+            QLabel#dropIcon { color: #3473d1; background: #eaf1ff; border-radius: 8px; font-size: 19px; font-weight: 600; }
             QLabel#badge { color: #3567bd; background: #eaf1ff; border-radius: 10px; padding: 8px 12px; }
             QLabel#status { color: #5c6678; padding-top: 2px; }
             QLabel#stage { color: #8791a2; background: #f6f7fa; border-radius: 8px; padding: 10px 6px; }
             QLabel#stage[active="true"] { color: #245bb5; background: #eaf1ff; font-weight: 650; }
             QLabel#stage[done="true"] { color: #25805b; background: #eaf7f1; }
             QLabel#emptyHint { color: #929bad; line-height: 1.5; }
-            QLabel#resultSummary { color: #276b4b; background: #eef8f2; border-radius: 8px; padding: 12px; }
             QLineEdit, QComboBox, QPlainTextEdit { background: #ffffff; border: 1px solid #dce2ec; border-radius: 8px; selection-background-color: #3974d2; }
             QLineEdit { min-height: 40px; padding: 0 12px; }
             QComboBox { min-height: 40px; padding: 0 10px; }
@@ -483,17 +642,100 @@ class VideoTextWindow(QMainWindow):
             self.url_entry.setText(clipboard_text)
             self.url_entry.setFocus()
 
+    def _on_input_mode_changed(self, index: int) -> None:
+        is_file = index == 1
+        self.online_mode_button.setChecked(not is_file)
+        self.file_mode_button.setChecked(is_file)
+        self.url_input_row.setVisible(not is_file)
+        self.file_input_row.setVisible(is_file)
+        self.input_hint.setText(
+            "选择本地音频或视频文件，程序会自动提取音轨并生成转写结果。"
+            if is_file
+            else "支持 Bilibili 和 YouTube 的公开视频"
+        )
+
+    def choose_input_file(self) -> None:
+        filters = (
+            "媒体文件 (*.wav *.mp3 *.m4a *.aac *.flac *.ogg *.opus *.wma *.aiff "
+            "*.aif *.amr *.ape *.caf *.mp4 *.mov *.mkv *.mka *.avi *.webm *.mpeg "
+            "*.mpg *.wmv *.flv *.m4v *.3gp *.3g2 *.mts *.m2ts *.ts *.vob *.ogv);;"
+            "所有文件 (*)"
+        )
+        start_dir = str(self.selected_file_path.parent) if self.selected_file_path else ""
+        selected, _ = QFileDialog.getOpenFileName(
+            self, "选择音频或视频文件", start_dir, filters
+        )
+        if selected:
+            self._set_selected_file(selected)
+
+    def _set_selected_file(self, value: str) -> None:
+        try:
+            path = validate_local_file(Path(value))
+        except (VideoTextError, OSError) as exc:
+            self.status_label.setText(str(exc))
+            self.file_input_row.setStyleSheet(
+                "QFrame#fileDropArea { border: 1px solid #d45b62; }"
+            )
+            return
+        self.selected_file_path = path
+        size_bytes = path.stat().st_size
+        if size_bytes >= 1024**3:
+            size_text = f"{size_bytes / 1024**3:.1f} GB"
+        elif size_bytes >= 1024**2:
+            size_text = f"{size_bytes / 1024**2:.1f} MB"
+        else:
+            size_text = f"{max(1, size_bytes // 1024)} KB"
+        self.selected_file_name.setText(path.name)
+        self.selected_file_name.setToolTip(str(path))
+        self.selected_file_detail.setText(f"本地媒体 · {size_text} · 点击或拖放可更换")
+        self.file_prompt.hide()
+        self.selected_file_card.show()
+        self.file_input_row.setStyleSheet("")
+        self.status_label.setText("文件已就绪，点击“开始转换”开始转写。")
+
+    def remove_selected_file(self) -> None:
+        self.selected_file_path = None
+        self.selected_file_name.clear()
+        self.selected_file_name.setToolTip("")
+        self.selected_file_detail.clear()
+        self.selected_file_card.hide()
+        self.file_prompt.show()
+        self.file_input_row.setStyleSheet("")
+        self.status_label.setText("已移除文件，请拖放或浏览选择媒体文件。")
+
     def start_task(self) -> None:
         if self.controller.is_running:
             return
-        try:
-            url = validate_url(self.url_entry.text().strip())
-        except VideoTextError as exc:
-            self.status_label.setText(str(exc))
-            self.url_entry.setFocus()
-            self.url_entry.setStyleSheet("border: 1px solid #d45b62;")
-            return
-        self.url_entry.setStyleSheet("")
+        input_type = "file" if self.input_mode_group.checkedId() == 1 else "url"
+        file_path: Path | None = None
+        if input_type == "url":
+            try:
+                url = validate_url(self.url_entry.text().strip())
+            except VideoTextError as exc:
+                self.status_label.setText(str(exc))
+                self.url_entry.setFocus()
+                self.url_entry.setStyleSheet("border: 1px solid #d45b62;")
+                return
+            self.url_entry.setStyleSheet("")
+        else:
+            try:
+                if self.selected_file_path is None:
+                    raise InputError("尚未选择文件。", "请拖放文件或点击浏览选择文件。")
+                file_path = validate_local_file(self.selected_file_path)
+            except (VideoTextError, OSError) as exc:
+                self.status_label.setText(str(exc))
+                focus_target = (
+                    self.browse_file_button
+                    if self.selected_file_path is None
+                    else self.replace_file_button
+                )
+                focus_target.setFocus()
+                self.file_input_row.setStyleSheet(
+                    "QFrame#fileDropArea { border: 1px solid #d45b62; }"
+                )
+                return
+            url = ""
+            self.file_input_row.setStyleSheet("")
         settings = self.current_settings()
         saved, detail = attempt_start(lambda: save_settings(self.settings_path, settings))
         if not saved:
@@ -501,7 +743,9 @@ class VideoTextWindow(QMainWindow):
             return
         task_id = uuid.uuid4().hex
         temp_root = Path(tempfile.gettempdir()) / "videotext-gui" / task_id
-        request = build_request(task_id, url, settings, temp_root)
+        request = build_request(
+            task_id, url, settings, temp_root, input_type=input_type, file_path=file_path
+        )
         self.active_task_id = task_id
         self._set_running(True)
         self.status_label.setText("正在启动工作进程…")
@@ -512,7 +756,6 @@ class VideoTextWindow(QMainWindow):
         self.closing = False
         self._reset_stages()
         self.idle_hint.hide()
-        self.result_summary.hide()
         self.log.clear()
         self.log.show()
         started, detail = attempt_start(
@@ -557,8 +800,7 @@ class VideoTextWindow(QMainWindow):
             self.open_srt_button.setEnabled(any(path.name == "transcript.srt" for path in self.last_paths))
             names = "、".join(path.name for path in self.last_paths)
             location = self.last_paths[0].parent if self.last_paths else self.output_entry.text()
-            self.result_summary.setText(f"已生成：{names}\n保存位置：{location}")
-            self.result_summary.show()
+            self._append_log(f"\n已生成：{names}\n保存位置：{location}")
             if self.open_output_check.isChecked():
                 self.open_output_dir()
         elif message_type == "error":
@@ -617,7 +859,10 @@ class VideoTextWindow(QMainWindow):
     def _set_running(self, running: bool) -> None:
         for widget in (
             self.url_entry,
+            self.online_mode_button,
+            self.file_mode_button,
             self.paste_button,
+            self.file_input_row,
             self.advanced_button,
             self.model_box,
             self.language_box,

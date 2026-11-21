@@ -17,8 +17,13 @@ class MediaMetadata:
 @dataclass(frozen=True, slots=True)
 class MediaSource:
     metadata: MediaMetadata
-    downloaded_audio_path: Path
+    media_path: Path
     raw_metadata: dict[str, Any]
+
+    @property
+    def downloaded_audio_path(self) -> Path:
+        """Compatibility alias for callers written before local-file input."""
+        return self.media_path
 
 
 @dataclass(frozen=True, slots=True)

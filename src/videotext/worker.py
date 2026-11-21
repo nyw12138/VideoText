@@ -53,6 +53,8 @@ def run_worker(
         config=TranscriptionConfig(model=request.model, language=request.language),
         keep_audio=request.keep_audio,
         overwrite=request.overwrite,
+        input_type=request.input_type,
+        file_path=request.file_path,
     )
     started = time.perf_counter()
 

@@ -1,3 +1,4 @@
+import hashlib
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -5,10 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .errors import CancelledError
+from .errors import CancelledError, InputError
 from .models import MediaMetadata, MediaSource, Transcript, TranscriptionConfig
 from .paths import output_directory
-from .validation import validate_media, validate_url
+from .validation import validate_local_file, validate_media, validate_url
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +25,8 @@ class RunOptions:
     config: TranscriptionConfig
     keep_audio: bool
     overwrite: bool
+    input_type: str = "url"
+    file_path: Path | None = None
 
 
 class Downloader(Protocol):
@@ -36,6 +39,8 @@ class AudioNormalizer(Protocol):
     def check_available(self) -> None: ...
 
     def normalize(self, source: Path, destination: Path) -> Path: ...
+
+    def probe_local_media(self, source: Path) -> float: ...
 
 
 class Transcriber(Protocol):
@@ -85,10 +90,31 @@ class VideoTextService:
             if is_cancelled():
                 raise CancelledError()
 
-        url = validate_url(options.url)
-        on_progress(ProgressEvent("probe", "正在读取媒体信息"))
-        probed_metadata = self.downloader.probe(url)
-        validate_media(probed_metadata)
+        local_path: Path | None = None
+        if options.input_type == "file":
+            if options.file_path is None:
+                raise InputError("缺少本地文件路径。")
+            local_path = validate_local_file(options.file_path)
+            on_progress(ProgressEvent("probe", "正在读取本地媒体信息"))
+            duration = self.audio.probe_local_media(local_path)
+            path_id = hashlib.sha256(str(local_path).casefold().encode("utf-8")).hexdigest()[:12]
+            local_metadata = MediaMetadata(
+                source_url="",
+                platform="local_file",
+                video_id=f"local_{path_id}",
+                title=local_path.stem,
+                duration=duration,
+                is_live=False,
+                is_playlist=False,
+            )
+            validate_media(local_metadata)
+        elif options.input_type == "url":
+            url = validate_url(options.url)
+            on_progress(ProgressEvent("probe", "正在读取媒体信息"))
+            probed_metadata = self.downloader.probe(url)
+            validate_media(probed_metadata)
+        else:
+            raise InputError("不支持的输入类型。")
         self.audio.check_available()
         check_cancelled()
 
@@ -96,15 +122,27 @@ class VideoTextService:
         task_dir = Path(tempfile.mkdtemp(prefix="videotext-", dir=self.temp_root))
         succeeded = False
         try:
-            on_progress(ProgressEvent("download", "正在下载音频"))
-            source = self.downloader.download(url, task_dir)
+            if local_path is not None:
+                on_progress(ProgressEvent("download", "正在读取本地媒体文件"))
+                source = MediaSource(
+                    local_metadata,
+                    local_path,
+                    {
+                        "source_type": "local_file",
+                        "file_name": local_path.name,
+                        "duration": local_metadata.duration,
+                    },
+                )
+            else:
+                on_progress(ProgressEvent("download", "正在下载音频"))
+                source = self.downloader.download(url, task_dir)
             validate_media(source.metadata)
             final_dir = output_directory(options.output_root, source.metadata)
             check_cancelled()
 
             on_progress(ProgressEvent("normalize", "正在标准化音频"))
             normalized = self.audio.normalize(
-                source.downloaded_audio_path, task_dir / "normalized.wav"
+                source.media_path, task_dir / "normalized.wav"
             )
             check_cancelled()
             on_progress(ProgressEvent("transcribe", "正在使用 GPU 转写"))

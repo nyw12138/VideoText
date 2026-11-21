@@ -1,23 +1,24 @@
-# videotext
+# VideoText 视频音频转写系统
 
-`videotext` 是一个 Windows 本地命令行工具：输入公开的 Bilibili、抖音或 YouTube 单视频链接，下载其中的音频，在 NVIDIA GPU 上使用 `faster-whisper` 转写，并输出 TXT、SRT 和 JSON。
+VideoText 是一款运行于 Windows 的本地音视频转写工具。桌面界面支持输入公开视频链接或本地音频、视频文件，提取音轨并使用 faster-whisper 识别语音，生成 TXT、SRT 和 JSON 等结果文件。
 
-## 使用边界
+## 功能
 
-- 只处理你拥有或获准使用的公开内容。
-- 第一版只支持单个点播视频，最长 3 小时。
-- 不支持播放列表、直播、登录内容、验证码、付费墙、DRM 或地区限制绕过。
-- 平台页面会变化；能否解析取决于当前安装的 `yt-dlp` 版本。
+- 在线链接：支持 Bilibili 和 YouTube 公开视频，解析由 yt-dlp 执行。
+- 本地媒体：可拖放或选择一个音频或视频文件。程序读取媒体时长与音轨，使用 FFmpeg 提取并标准化音频。
+- 转写设置：可选 `large-v3-turbo` 或 `medium` 模型，以及自动检测、中文、英文转写语言。
+- 结果：生成 `transcript.txt`、`transcript.srt`、`transcript.json`、`source.json`。启用保留音频时另存 `audio.wav`。
+- 任务操作：显示处理阶段和用时，支持停止任务、复制诊断信息，以及打开输出目录、TXT 和 SRT。
+- 输出选项：可设置输出目录、是否覆盖已有结果、完成后是否自动打开输出目录。
+
+每次任务处理一个媒体，时长上限为 3 小时。输入类型为单个点播媒体；播放列表、直播及无音轨媒体不在支持范围内。在线链接解析依赖 yt-dlp 与平台访问状态。
 
 ## 环境要求
 
-- Windows 10/11
-- Python 3.11 或更新版本
-- NVIDIA GPU
-- 与当前 CTranslate2 版本兼容的 CUDA 运行库；当前官方路线要求 CUDA 12 的 cuBLAS 和 cuDNN 9
-- FFmpeg，且 `ffmpeg.exe` 已加入 `PATH`
-
-CUDA 与 cuDNN 的具体兼容要求请以 [faster-whisper 官方文档](https://github.com/SYSTRAN/faster-whisper)为准。NVIDIA 对 Windows CUDA 12.1 给出的最低驱动版本为 527.41，建议直接安装适合显卡的最新稳定驱动，参见 [CUDA 12.1 发布说明](https://docs.nvidia.com/cuda/archive/12.1.0/cuda-toolkit-release-notes/)。FFmpeg 可从 [FFmpeg 官方下载页](https://ffmpeg.org/download.html)获取。
+- Windows 10 或 Windows 11，Python 3.11 及以上
+- FFmpeg 与 FFprobe，并确保 `ffmpeg.exe`、`ffprobe.exe` 在 `PATH` 中
+- 兼容 faster-whisper/CTranslate2 的运行环境
+- GPU 转写使用 CUDA，需要兼容的 NVIDIA GPU 驱动、CUDA/cuBLAS 和 cuDNN。
 
 ## 安装
 
@@ -26,119 +27,77 @@ CUDA 与 cuDNN 的具体兼容要求请以 [faster-whisper 官方文档](https:/
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
+winget install --id Gyan.FFmpeg -e
+```
+
+安装 FFmpeg 后，关闭并重新打开终端，再确认命令可用：
+
+```powershell
 ffmpeg -version
+ffprobe -version
 nvidia-smi
-videotext --help
 ```
 
 首次转写会下载所选 Whisper 模型，需要额外时间和磁盘空间。
 
-## 使用
+## 启动桌面界面
+
+在已安装依赖的项目虚拟环境中运行：
 
 ```powershell
-videotext "https://www.bilibili.com/video/BV..."
-videotext "https://www.youtube.com/watch?v=..." --output .\outputs
-videotext "https://www.douyin.com/video/..." --language zh
+videotext-gui
+```
+
+也可运行 `python -m videotext.gui`，或双击项目根目录的 `Start VideoText.vbs`（需预先配置项目 `.venv`）。界面中选择“在线链接”或“本地文件”，提供媒体后点击“开始转换”。本地文件区域支持拖放和点击浏览；原始本地文件保持原位。
+
+高级设置可以更改模型、语言、输出目录、保留标准化音频、覆盖已有结果及完成后打开输出目录等选项。任务完成后，结果区域显示文件名与保存路径。
+
+## 命令行
+
+命令行入口当前仅接收公开视频 URL：
+
+```powershell
+videotext --help
+videotext URL
+videotext URL --output .\outputs
+videotext URL --language zh
 videotext URL --model large-v3 --keep-audio
 videotext URL --overwrite --verbose
 ```
 
-默认输出：
+CLI 支持 `--output`、`--model`、`--language`、`--keep-audio`、`--overwrite` 和 `--verbose`。本地文件转写请使用桌面界面。
+
+## 输出文件
+
+每个任务在所选输出根目录下创建独立结果目录：
 
 ```text
 outputs/
-└── 视频标题_视频ID/
+└── 媒体名称_标识/
     ├── transcript.txt
     ├── transcript.srt
     ├── transcript.json
     └── source.json
 ```
 
-使用 `--keep-audio` 时会额外生成 `audio.wav`。已有结果默认不会被覆盖；`--overwrite` 使用目录级原子替换，失败时恢复旧目录。
+`transcript.txt` 保存纯文本；`transcript.srt` 保存带时间戳字幕；`transcript.json` 保存转写段、识别语言及模型等信息；`source.json` 保存来源元数据。启用保留音频后会多生成 `audio.wav`。CLI 默认不覆盖已有结果，需使用 `--overwrite`；GUI 的覆盖行为由高级设置控制。
 
-## Windows 图形界面
+## 数据位置与隐私
 
-当前电脑可以直接双击项目根目录中的：
-
-```text
-Start VideoText.vbs
-```
-
-它会使用现有 `.venv` 在后台打开独立窗口，不显示 PowerShell，也不需要重新输入命令。
-
-在已激活的项目虚拟环境中重新安装入口并启动：
-
-```powershell
-python -m pip install -e ".[dev]"
-videotext-gui
-```
-
-图形界面使用 PySide6 构建。启动后粘贴完整的 Bilibili、抖音或 YouTube 视频链接并点击“开始转换”；链接中的 `&` 会作为普通网址字符处理，无需手动删除。高级设置可选择模型、语言、输出目录，以及是否保留音频或覆盖已有结果。转换进度按实际处理阶段显示，完成后可直接打开输出目录、TXT 和 SRT 文件。
-
-为当前电脑创建桌面快捷方式：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\create_desktop_shortcut.ps1
-```
-
-创建成功后，可以双击桌面的“VideoText 视频转文字”直接打开独立窗口，不需要先打开 PowerShell 或手动激活 `.venv`。
-
-GUI 设置和日志分别位于：
+GUI 设置和日志分别保存在：
 
 ```text
 %LOCALAPPDATA%\VideoText\settings.json
 %LOCALAPPDATA%\VideoText\logs\videotext.log
 ```
 
-设置文件只保存模型、语言、输出目录等界面选项，不保存视频链接、Cookie、令牌或转写文本。
-
-如果 GPU 工作进程异常退出，GUI 会保持打开。可以点击“复制详细信息”获取诊断信息，再在已激活的虚拟环境中运行以下命令进一步排查：
-
-```powershell
-videotext "URL" --verbose
-```
-
-如果桌面快捷方式无法启动，请确认项目目录仍在原位置，并检查以下文件是否存在：
-
-```text
-.venv\Scripts\pythonw.exe
-```
-
-移动项目目录或重建 `.venv` 后，重新执行快捷方式创建脚本即可。
+设置文件保存模型、语言、输出目录等界面选项，不保存视频链接或转写文本。
 
 ## 常见问题
 
-平台解析失败时先升级 `yt-dlp`：
-
-```powershell
-python -m pip install --upgrade yt-dlp
-```
-
-显存不足时使用较小模型：
-
-```powershell
-videotext URL --model medium
-```
-
-默认不会静默回退 CPU，避免长视频在不知情的情况下运行很久。
-
-GTX 1660 Ti 6GB 可以先尝试默认的 `large-v3-turbo`。若出现 `CUDA out of memory`，改用 `medium`；不要启用批量推理，因为批量模式会显著增加显存占用。
-
-## 开发验证
-
-```powershell
-python -m pytest -q
-python -m ruff check src tests
-```
-
-普通测试不会访问视频平台、调用 FFmpeg 或加载 GPU 模型。只有显式设置测试链接时才执行真实冒烟测试：
-
-```powershell
-$env:VIDEOTEXT_SMOKE_URL=$env:AUTHORIZED_PUBLIC_VIDEO_URL
-python -m pytest tests/test_smoke_local.py -q
-Remove-Item Env:VIDEOTEXT_SMOKE_URL
-```
-
-`AUTHORIZED_PUBLIC_VIDEO_URL` 应由用户环境提供，不要把真实测试链接或任何凭证写进仓库。
+- 平台解析失败：确认网址可访问，并更新 yt-dlp：`python -m pip install --upgrade yt-dlp`。解析结果受 yt-dlp 版本和平台页面变化影响。
+- 本地媒体无法读取：确认文件含有音轨、未损坏，并且当前 FFmpeg 支持该媒体容器与编码。
+- 找不到 FFmpeg/FFprobe：将两者所在目录加入 `PATH` 后重新启动程序。
+- GPU 或模型加载失败：检查显卡驱动、CUDA/cuDNN 与 CTranslate2 的兼容情况；显存不足可改用 `medium`。
+- 查看诊断：在 GUI 中点击“复制诊断信息”；CLI 可使用 `--verbose` 输出详细异常信息。

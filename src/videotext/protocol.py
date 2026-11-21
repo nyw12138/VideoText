@@ -19,11 +19,14 @@ class WorkerRequest:
     language: str | None
     keep_audio: bool
     overwrite: bool
+    input_type: str = "url"
+    file_path: Path | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["output_root"] = str(self.output_root)
         data["temp_root"] = str(self.temp_root)
+        data["file_path"] = str(self.file_path) if self.file_path is not None else None
         return data
 
     @classmethod
@@ -42,21 +45,32 @@ class WorkerRequest:
             raise ProtocolError("任务请求缺少必要字段")
         if not isinstance(data["task_id"], str) or not data["task_id"]:
             raise ProtocolError("task_id 无效")
-        if not isinstance(data["url"], str) or not data["url"].strip():
+        input_type = data.get("input_type", "url")
+        if not isinstance(input_type, str) or input_type not in {"url", "file"}:
+            raise ProtocolError("input_type 无效")
+        url = data["url"]
+        if not isinstance(url, str):
             raise ProtocolError("url 无效")
+        file_path_value = data.get("file_path")
+        if input_type == "url" and (not url.strip() or file_path_value):
+            raise ProtocolError("URL 输入无效")
+        if input_type == "file" and (not isinstance(file_path_value, str) or not file_path_value.strip() or (isinstance(url, str) and url.strip())):
+            raise ProtocolError("本地文件输入无效")
         if data["language"] is not None and not isinstance(data["language"], str):
             raise ProtocolError("language 无效")
         if not isinstance(data["keep_audio"], bool) or not isinstance(data["overwrite"], bool):
             raise ProtocolError("布尔选项无效")
         return cls(
             task_id=data["task_id"],
-            url=data["url"].strip(),
+            url=url.strip() if isinstance(url, str) else "",
             output_root=Path(data["output_root"]),
             temp_root=Path(data["temp_root"]),
             model=str(data["model"]),
             language=data["language"],
             keep_audio=data["keep_audio"],
             overwrite=data["overwrite"],
+            input_type=input_type,
+            file_path=Path(file_path_value) if file_path_value else None,
         )
 
 
